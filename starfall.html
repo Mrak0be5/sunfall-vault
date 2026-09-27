@@ -146,6 +146,16 @@ footer{bottom:23px;padding-top:16px;font-size:9px;color:#8aa0a9;letter-spacing:1
 }
 /* Stat gains float below the values on phones, clear of the rarity nameplate. */
 @media(max-width:760px){.relic-info .stat>em{top:44px;right:4px;font-size:10px}}
+
+/* Tiny live diagnostic: no animated shadows or constantly repainting charts. */
+.fps-meter{position:absolute;right:4.6%;top:92px;z-index:11;padding:5px 9px;border:1px solid #829a9850;border-radius:8px;background:#10222cd9;color:#caff9c;font:700 11px/1.2 'Nunito',sans-serif;font-variant-numeric:tabular-nums;min-width:66px;text-align:center;contain:content;pointer-events:none}
+.fps-meter[data-status="slow"]{color:#ffd785}.fps-meter[data-status="paused"]{color:#a0b4bd}
+@media(max-width:760px){.fps-meter{right:16px;top:121px;font-size:10px;padding:4px 6px;min-width:60px}}
+@media(max-height:780px) and (min-width:761px){.fps-meter{top:77px}}
+/* Hidden phases need no compositor animation, but retain their original artwork. */
+#app[data-state="reveal"] #backdrop .rays,#app[data-state="results"] #backdrop .rays,#app[data-state="claimed"] #backdrop .rays{animation-play-state:paused}
+#app:not([data-state="reveal"]):not([data-state="results"]):not([data-state="claimed"]) .hero-aura{animation-play-state:paused}
+#app:not([data-state="charge"]):not([data-state="burst"]) #pillar i{animation-play-state:paused}
 </style>
 </head>
 <body>
@@ -157,6 +167,7 @@ footer{bottom:23px;padding-top:16px;font-size:9px;color:#8aa0a9;letter-spacing:1
   <canvas id="world" aria-label="A three-dimensional enchanted treasure vault" role="img"></canvas>
   <canvas id="particles" aria-hidden="true"></canvas>
   <div id="bloom" aria-hidden="true"></div>
+  <output id="fps-meter" class="fps-meter" aria-label="Frame rate" title="Actual rendered frame rate">— FPS</output>
   <header class="hud">
     <a class="brand" href="#" aria-label="Starfall home"><span class="brand-mark">✦</span><span>STARFALL<small>A LITTLE LUCK. A LOT OF WONDER.</small></span></a>
     <div class="mode-switch" role="group" aria-label="Playback mode"><button id="auto-mode" class="selected" aria-pressed="true">One tap</button><button id="manual-mode" aria-pressed="false">Tap to upgrade</button></div>
@@ -451,6 +462,71 @@ window.createRewardModels = function (THREE) {
       heroGems[i].rotation.z=Math.sin(time*.9+i)*.10;
     }
   }
+  // Batch rigid pieces by their actual material object. This keeps every plank,
+  // bevel and facet, but submits one mesh per material in each articulated part.
+  // Work in the direct parent's space: neither the hinge nor rarity visibility
+  // nor the two independently animated gems are baked into the combined mesh.
+  function batchRigidParts(parent, excluded = new Set()) {
+    const batches = new Map();
+    for (const part of parent.children) {
+      if (!part.isMesh || part.children.length || excluded.has(part) ||
+          Array.isArray(part.material) || part.material.transparent) continue;
+      part.updateMatrix();
+      // A mirrored transform needs reversed winding; leave such parts separate.
+      if (part.matrix.determinant() <= 0) continue;
+      const attributes = Object.keys(part.geometry.attributes).sort();
+      const signature = [part.visible, part.renderOrder, part.layers.mask,
+        part.castShadow, part.receiveShadow, ...attributes.map(name => {
+          const a = part.geometry.attributes[name];
+          return `${name}:${a.itemSize}:${a.normalized}:${a.array.constructor.name}`;
+        })].join('|');
+      let materialBatches = batches.get(part.material);
+      if (!materialBatches) batches.set(part.material, materialBatches = new Map());
+      if (!materialBatches.has(signature)) materialBatches.set(signature, []);
+      materialBatches.get(signature).push(part);
+    }
+    for (const [material, materialBatches] of batches) {
+      for (const parts of materialBatches.values()) {
+        if (parts.length < 2) continue;
+        const geometries = parts.map(part => part.geometry.clone().applyMatrix4(part.matrix));
+        const vertexCount = geometries.reduce((sum, g) => sum + g.attributes.position.count, 0);
+        const indexCount = geometries.reduce((sum, g) => sum + (g.index ? g.index.count : g.attributes.position.count), 0);
+        const combined = new THREE.BufferGeometry();
+        for (const name of Object.keys(geometries[0].attributes)) {
+          const first = geometries[0].attributes[name];
+          const values = new first.array.constructor(vertexCount * first.itemSize);
+          let offset = 0;
+          for (const g of geometries) {
+            values.set(g.attributes[name].array, offset);
+            offset += g.attributes[name].array.length;
+          }
+          combined.setAttribute(name, new THREE.BufferAttribute(values, first.itemSize, first.normalized));
+        }
+        const indices = vertexCount > 65535 ? new Uint32Array(indexCount) : new Uint16Array(indexCount);
+        let indexOffset = 0, vertexOffset = 0;
+        for (const g of geometries) {
+          const count = g.index ? g.index.count : g.attributes.position.count;
+          for (let i = 0; i < count; i++) indices[indexOffset++] = vertexOffset + (g.index ? g.index.getX(i) : i);
+          vertexOffset += g.attributes.position.count;
+          g.dispose();
+        }
+        combined.setIndex(new THREE.BufferAttribute(indices, 1));
+        combined.computeBoundingBox();
+        combined.computeBoundingSphere();
+        const merged = new THREE.Mesh(combined, material), first = parts[0];
+        merged.name = 'Rigid material batch';
+        merged.visible = first.visible;
+        merged.renderOrder = first.renderOrder;
+        merged.layers.mask = first.layers.mask;
+        merged.castShadow = first.castShadow;
+        merged.receiveShadow = first.receiveShadow;
+        for (const part of parts) parent.remove(part);
+        parent.add(merged);
+      }
+    }
+  }
+  for (const group of [chest, lid, lidCrown, ...rarityOrnaments]) batchRigidParts(group);
+  batchRigidParts(hero, new Set(heroGems));
   return {chest,lid,hero,shadow,materials,setTier,setSeamGlow,update};
 };
 
@@ -462,6 +538,7 @@ window.createRewardModels = function (THREE) {
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const ease = t => 1 - Math.pow(1 - t, 3);
   const ink = '#1A1033';
+  const waveStrokes = [[15, .035], [5, .12], [1.25, .6]];
   const palettes = {
     coin: ['#FFF4A5', '#FFC83D', '#C47A22'],
     gem: ['#D8FFF4', '#76EFD1', '#269A99']
@@ -486,6 +563,7 @@ window.createRewardModels = function (THREE) {
       this.frameDt = 1 / 60;
       this.time = 0;
       this.streamersUsed = false;
+      this.surfaceDirty = false;
       this.halos = new Map();
       this.resize(canvas.clientWidth || 1, canvas.clientHeight || 1, window.devicePixelRatio || 1);
     }
@@ -498,6 +576,8 @@ window.createRewardModels = function (THREE) {
       this.canvas.style.width = w + 'px';
       this.canvas.style.height = h + 'px';
       this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      // Assigning either backing-store dimension already clears the canvas.
+      this.surfaceDirty = false;
     }
 
     setColor(hex) { this.color = hex; }
@@ -628,6 +708,7 @@ window.createRewardModels = function (THREE) {
       this.orbitState.enabled = false; this.streamersUsed = false; this.orbitClock = 0;
       this.pillarState.enabled = false; this.pillarClock = 0; this.chargeClock = 0;
       this.ctx.clearRect(0, 0, this.width, this.height);
+      this.surfaceDirty = false;
     }
 
     drawToken(p, opacity) {
@@ -657,7 +738,12 @@ window.createRewardModels = function (THREE) {
     update(dt, time = 0) {
       dt = clamp(dt || .016, .001, .04); this.time = time; this.frameDt = dt;
       const c = this.ctx;
-      c.clearRect(0, 0, this.width, this.height);
+      // The transparent FX layer is empty for most of ready/results. Avoid
+      // dirtying its supersampled backing store (and uploading it) every frame.
+      if (this.surfaceDirty) {
+        c.clearRect(0, 0, this.width, this.height);
+        this.surfaceDirty = false;
+      }
       const orbit = this.orbitState;
       if (orbit.enabled) {
         this.orbitClock += dt;
@@ -681,6 +767,8 @@ window.createRewardModels = function (THREE) {
             color: '#FFF0B5' });
         }
       }
+      if (!this.particles.length && !this.waves.length) return;
+      this.surfaceDirty = true;
       c.save(); c.globalCompositeOperation = 'lighter';
       for (let i = this.waves.length - 1; i >= 0; i--) {
         const w = this.waves[i]; w.age += dt;
@@ -688,19 +776,20 @@ window.createRewardModels = function (THREE) {
         if (w.age < 0) continue;
         const t = w.age / w.life, r = w.radius + (w.end - w.radius) * ease(t);
         c.strokeStyle = w.color;
-        for (const [width, alpha] of [[15, .035], [5, .12], [1.25, .6]]) {
+        for (const [width, alpha] of waveStrokes) {
           c.globalAlpha = (1 - t) * (1 - t) * alpha;
           c.lineWidth = width; c.beginPath(); c.ellipse(w.x, w.y, r, r * .75, 0, 0, TAU); c.stroke();
         }
       }
       c.restore();
-      const arrivals = [];
+      let arrivals = null;
+      c.save();
       for (let i = this.particles.length - 1; i >= 0; i--) {
         const p = this.particles[i]; p.age += dt;
         const t = clamp(p.age / p.life, 0, 1);
         if (p.age >= p.life) {
           this.particles.splice(i, 1);
-          if (p.mode === 'flight' && typeof p.onArrival === 'function') arrivals.push(p.onArrival);
+          if (p.mode === 'flight' && typeof p.onArrival === 'function') (arrivals || (arrivals = [])).push(p.onArrival);
           continue;
         }
         p.rotation += p.spin * dt;
@@ -719,11 +808,22 @@ window.createRewardModels = function (THREE) {
           p.x = u * u * u * p.from.x + 3 * u * u * k * p.c1.x + 3 * u * k * k * p.c2.x + k * k * k * p.to.x;
           p.y = u * u * u * p.from.y + 3 * u * u * k * p.c1.y + 3 * u * k * k * p.c2.y + k * k * k * p.to.y;
         } else {
-          p.vx *= Math.exp(-p.drag * dt); p.vy *= Math.exp(-p.drag * dt);
+          const drag = Math.exp(-p.drag * dt);
+          p.vx *= drag; p.vy *= drag;
           p.vy += p.gravity * dt; p.x += p.vx * dt; p.y += p.vy * dt;
         }
         const opacity = p.alpha * (p.mode === 'flight' ? Math.min(t * 10, 1) : Math.min(t * 12, 1) * Math.pow(1 - t, .65));
         if (p.type === 'coin' || p.type === 'gem') { this.drawToken(p, opacity); continue; }
+        if (p.type === 'spark') {
+          // Circular sparks do not rotate: absolute coordinates preserve the
+          // exact artwork without a save/translate/restore trip per particle.
+          const size = p.size;
+          c.globalCompositeOperation = 'lighter'; c.globalAlpha = opacity * .25;
+          c.drawImage(this.halo(p.color), p.x - size * 5, p.y - size * 5, size * 10, size * 10);
+          c.globalAlpha = opacity * .85; c.fillStyle = p.color;
+          c.beginPath(); c.arc(p.x, p.y, size, 0, TAU); c.fill();
+          continue;
+        }
         c.save(); c.globalCompositeOperation = 'lighter';
         if (p.type === 'ray') {
           const r = p.radius + p.speed * p.age;
@@ -752,7 +852,8 @@ window.createRewardModels = function (THREE) {
         }
         c.restore();
       }
-      arrivals.forEach(callback => callback());
+      c.restore();
+      if (arrivals) arrivals.forEach(callback => callback());
     }
   }
 
@@ -930,12 +1031,191 @@ window.createRewardModels = function (THREE) {
 
 (() => {
 'use strict';
+
+// RAF timing is measured independently of the simulation's clamped delta.
+// workMs is CPU submission time, not a GPU timing or total frame cost.
+const CAPACITY = 600, PHASE_CAPACITY = 600, MAX_PHASES = 16;
+const percentile = (sorted, p) => sorted.length ? sorted[Math.max(0, Math.ceil(sorted.length * p) - 1)] : null;
+const finite = value => typeof value === 'number' && Number.isFinite(value);
+
+class FrameMeter {
+  constructor(element) {
+    this.element = element || null;
+    this._manualPause = false;
+    this._hidden = typeof document !== 'undefined' && document.hidden;
+    this._times = new Float64Array(CAPACITY);
+    this._work = new Float64Array(CAPACITY);
+    this._phases = new Map();
+    this._onVisibility = () => {
+      this._hidden = document.hidden;
+      this._clearWindow();
+      this._paint(null);
+    };
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', this._onVisibility);
+    this.reset();
+  }
+
+  get paused() { return this._manualPause || this._hidden; }
+
+  _clearWindow() {
+    this._last = null;
+    this._lastPaint = null;
+    this._cursor = this._count = 0;
+    this._meta = {};
+  }
+
+  reset() {
+    this._clearWindow();
+    this._phases.clear();
+    this._totalFrames = 0;
+    this._totalMs = 0;
+    this._paint(null);
+  }
+
+  suspend() {
+    this._manualPause = true;
+    this._clearWindow();
+    this._paint(null);
+  }
+
+  resume() {
+    this._manualPause = false;
+    this._clearWindow();
+    this._paint(null);
+  }
+
+  sample(timestamp, meta = {}) {
+    if (this.paused || !finite(timestamp)) return;
+    if (this._last === null) {
+      this._last = timestamp;
+      this._lastPaint = timestamp;
+      return;
+    }
+    const elapsed = timestamp - this._last;
+    // Duplicate or out-of-order timestamps are not extra displayed frames.
+    if (elapsed <= 0) return;
+    this._last = timestamp;
+    const work = finite(meta.workMs) && meta.workMs >= 0 ? meta.workMs : NaN;
+    this._times[this._cursor] = elapsed;
+    this._work[this._cursor] = work;
+    this._cursor = (this._cursor + 1) % CAPACITY;
+    this._count = Math.min(this._count + 1, CAPACITY);
+    this._totalFrames++;
+    this._totalMs += elapsed;
+    this._meta = meta;
+
+    let key = typeof meta.state === 'string' ? meta.state : 'unknown';
+    if (!this._phases.has(key) && this._phases.size >= MAX_PHASES - 1) key = 'other';
+    let phase = this._phases.get(key);
+    if (!phase) {
+      phase = { frames: 0, totalMs: 0, workMs: 0, workFrames: 0, maxMs: 0, cursor: 0, count: 0, times: new Float64Array(PHASE_CAPACITY) };
+      this._phases.set(key, phase);
+    }
+    phase.frames++;
+    phase.totalMs += elapsed;
+    phase.maxMs = Math.max(phase.maxMs, elapsed);
+    if (finite(work)) { phase.workMs += work; phase.workFrames++; }
+    phase.times[phase.cursor] = elapsed;
+    phase.cursor = (phase.cursor + 1) % PHASE_CAPACITY;
+    phase.count = Math.min(phase.count + 1, PHASE_CAPACITY);
+
+    // DOM writes and percentile sorting happen only twice a second.
+    if (timestamp - this._lastPaint >= 500) {
+      this._lastPaint = timestamp;
+      this._paint(this._window());
+    }
+  }
+
+  _window() {
+    let elapsed = 0, frames = 0, work = 0, workFrames = 0;
+    const times = [];
+    for (let n = 0; n < this._count; n++) {
+      const i = (this._cursor - 1 - n + CAPACITY) % CAPACITY;
+      times.push(this._times[i]);
+      // Include complete RAF intervals, including long stalls; never cap at 60.
+      if (elapsed < 1000) {
+        elapsed += this._times[i];
+        frames++;
+        if (finite(this._work[i])) { work += this._work[i]; workFrames++; }
+      }
+    }
+    times.sort((a, b) => a - b);
+    const ready = frames >= 6 && elapsed >= 250;
+    return {
+      fps: ready ? frames * 1000 / elapsed : null,
+      averageFrameMs: ready ? elapsed / frames : null,
+      p50FrameMs: percentile(times, .50),
+      p95FrameMs: percentile(times, .95),
+      p99FrameMs: percentile(times, .99),
+      percentileWindowFrames: times.length,
+      averageWorkMs: workFrames ? work / workFrames : null,
+      jsSubmissionMs: workFrames ? work / workFrames : null,
+      fpsWindowFrames: frames,
+      fpsWindowMs: elapsed
+    };
+  }
+
+  _paint(stats) {
+    if (!this.element) return;
+    const fps = stats && stats.fps;
+    const text = this.paused ? '— FPS' : fps === null || fps === undefined ? '-- FPS' : `${Math.round(fps)} FPS`;
+    if (this.element.textContent !== text) this.element.textContent = text;
+    this.element.dataset.status = this.paused ? 'paused' : fps == null ? 'warming' : fps >= 55 ? 'smooth' : fps >= 40 ? 'moderate' : 'slow';
+    this.element.title = this.paused ? 'Rendering paused; no FPS sample' : fps == null ? 'Measuring real animation frames…' :
+      `${fps.toFixed(1)} FPS · ${stats.averageFrameMs.toFixed(1)} ms/frame · p95 ${stats.p95FrameMs.toFixed(1)} ms` +
+      (stats.averageWorkMs === null ? '' : ` · JS submission ${stats.averageWorkMs.toFixed(1)} ms (not GPU time)`);
+  }
+
+  snapshot() {
+    const phases = {};
+    for (const [state, phase] of this._phases) {
+      const sorted = Array.from(phase.times.subarray(0, phase.count)).sort((a, b) => a - b);
+      phases[state] = {
+        frames: phase.frames,
+        elapsedMs: phase.totalMs,
+        fps: phase.frames * 1000 / phase.totalMs,
+        averageFrameMs: phase.totalMs / phase.frames,
+        maxFrameMs: phase.maxMs,
+        averageWorkMs: phase.workFrames ? phase.workMs / phase.workFrames : null,
+        p50FrameMs: percentile(sorted, .50),
+        p95FrameMs: percentile(sorted, .95),
+        p99FrameMs: percentile(sorted, .99),
+        percentileWindowFrames: phase.count
+      };
+    }
+    return {
+      ...this._window(),
+      paused: this.paused,
+      drawCalls: finite(this._meta.drawCalls) ? this._meta.drawCalls : null,
+      triangles: finite(this._meta.triangles) ? this._meta.triangles : null,
+      pixelRatio: finite(this._meta.pixelRatio) ? this._meta.pixelRatio : null,
+      totalFrames: this._totalFrames,
+      totalElapsedMs: this._totalMs,
+      phases
+    };
+  }
+
+  destroy() {
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this._onVisibility);
+    this.suspend();
+  }
+}
+
+window.FrameMeter = FrameMeter;
+})();
+
+(() => {
+'use strict';
 const CONFIG = window.VAULT_CONFIG = { supersampling:1.5, msaa:4, upgradeDuration:1.48, tierPause:.24, chargeDuration:1.15, burstDuration:1.0, revealDuration:3.15, resultsDuration:1.65, intensity:1, shake:1, flashOpacity:.70, cameraPush:.55, outerLine:2.1, innerLine:.8, tierBurstStrength:[.7,1,1.4,1.9], coins:2400, gems:120 };
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const app=$('#app'), reduced=matchMedia('(prefers-reduced-motion: reduce)').matches, mobile=()=>innerWidth<=760;
 const audio=new RewardAudio(), fx=new RewardFX($('#particles'),{reducedMotion:reduced});
 let state='ready',tier=0,mode='auto',busy=false,master=null,loops=[],idleEnabled=true,muted=false,started=false,debugPaused=false;
-let width=innerWidth,height=innerHeight,frameCount=0,frameSamples=[],lastTime=performance.now(),phaseStarted=0,history=[];
+let width=innerWidth,height=innerHeight,lastTime=performance.now(),phaseStarted=0,history=[];
+const fpsMeter=new FrameMeter($('#fps-meter'));
+const floorShadow=$('#floor-shadow');
+let worldCleared=false;
+const renderStats={calls:0,triangles:0};
 const pose={y:0,ry:-.42,rx:0,rz:0,sx:1,sy:1,sz:1,charge:0,shakeX:0,shakeY:0,shakeZ:0,cameraPush:0,heroScale:0,heroY:0,heroRY:0};
 const tiers=[
  {name:'COMMON',color:'#71d986',accent:'#bcf184',bg:'#101e2b',light:'#cdffac',title:'BIG THINGS INSIDE.',sub:'Every spark is a step closer to extraordinary.',orn:'●'},
@@ -946,7 +1226,7 @@ const tiers=[
 let renderer,scene,camera,model,normalRT,colorRT,postScene,postCamera,postMaterial,rim,normalMaterial,transparentMeshes=[];
 function init3D(){
  renderer=new THREE.WebGLRenderer({canvas:$('#world'),alpha:true,antialias:true,powerPreference:'high-performance',preserveDrawingBuffer:false});
- renderer.setClearColor(0x000000,0);renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.NoToneMapping;
+ renderer.setClearColor(0x000000,0);renderer.autoClear=false;renderer.info.autoReset=false;renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.NoToneMapping;
  scene=new THREE.Scene(); camera=new THREE.PerspectiveCamera(36,1,.1,70);camera.position.set(0,3.0,11.5);camera.lookAt(0,0,0);
  scene.add(new THREE.DirectionalLight(0xffefd5,1.55));scene.children[0].position.set(-4,7,7);
  const sky=new THREE.HemisphereLight(0xbbdbff,0x262044,1.1);scene.add(sky);
@@ -964,18 +1244,43 @@ function init3D(){
  float linearDepth(float d){return (2.0*nearClip*farClip)/(farClip+nearClip-(d*2.0-1.0)*(farClip-nearClip));}
  void main(){vec4 col=texture2D(tColor,vUv);vec4 n=texture2D(tNormal,vUv);float mask=step(.1,n.a);float silhouette=0.;float detail=0.;float depthEdge=0.;float z=linearDepth(texture2D(tDepth,vUv).x);
  for(int i=0;i<8;i++){float a=float(i)*.785398;vec2 dir=vec2(cos(a),sin(a));vec2 u=vUv+dir*outerWidth/resolution;vec4 nb=texture2D(tNormal,u);silhouette=max(silhouette,abs(mask-step(.1,nb.a)));
- vec2 v=vUv+dir*innerWidth/resolution;vec4 nn=texture2D(tNormal,v);float both=mask*step(.1,nn.a);detail=max(detail,smoothstep(.58,.93,length(n.rgb-nn.rgb))*both);float zn=linearDepth(texture2D(tDepth,v).x);depthEdge=max(depthEdge,step(max(.38,z*.065),abs(z-zn))*both);}
+ if(mask<.5)continue;vec2 v=vUv+dir*innerWidth/resolution;vec4 nn=texture2D(tNormal,v);float both=mask*step(.1,nn.a);detail=max(detail,smoothstep(.58,.93,length(n.rgb-nn.rgb))*both);float zn=linearDepth(texture2D(tDepth,v).x);depthEdge=max(depthEdge,step(max(.38,z*.065),abs(z-zn))*both);}
  float edge=max(silhouette,max(detail*.78,depthEdge*.42));float alpha=max(col.a,silhouette);vec3 rgb=mix(col.rgb,ink,edge);gl_FragColor=vec4(rgb,alpha);
  #include <colorspace_fragment>
  }`});postScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2),postMaterial));resize();
  renderer.compile(scene,camera);setTier(0,false);
 }
-function resize(){width=innerWidth;height=Math.max(innerHeight,620);if(!renderer)return;const ratio=Math.min(devicePixelRatio||1,1.5)*CONFIG.supersampling;renderer.setPixelRatio(ratio);renderer.setSize(width,height,false);colorRT.setSize(Math.round(width*ratio),Math.round(height*ratio));normalRT.setSize(Math.round(width*ratio),Math.round(height*ratio));postMaterial.uniforms.resolution.value.set(width*ratio,height*ratio);postMaterial.uniforms.outerWidth.value=CONFIG.outerLine*ratio;postMaterial.uniforms.innerWidth.value=CONFIG.innerLine*ratio;camera.aspect=width/height;camera.fov=mobile()?44:36;camera.updateProjectionMatrix();fx.resize(width,height,Math.min(devicePixelRatio||1,1.5));if(state==='reveal'){const c=center();fx.orbit(c.x,c.y,mobile()?170:250,mobile()?182:212,!mobile())}}
-function render(){
+function resize(){
+ width=innerWidth;height=Math.max(innerHeight,620);if(!renderer)return;
+ // Only allocate pixels around the central stage. Keep exactly the same camera
+ // projection and 1.5x supersampling; the transparent side margins cost nothing.
+ const cropWidth=Math.min(width,Math.ceil(height*.70)+12),cropHeight=Math.min(height,Math.ceil(height*.82)+12),cropX=Math.floor((width-cropWidth)/2);
+ const ratio=Math.min(devicePixelRatio||1,1.5)*CONFIG.supersampling;
+ renderer.setPixelRatio(ratio);renderer.setSize(cropWidth,cropHeight,false);
+ Object.assign($('#world').style,{left:cropX+'px',width:cropWidth+'px',height:cropHeight+'px'});
+ const rw=Math.round(cropWidth*ratio),rh=Math.round(cropHeight*ratio);
+ colorRT.setSize(rw,rh);normalRT.setSize(rw,rh);postMaterial.uniforms.resolution.value.set(rw,rh);
+ postMaterial.uniforms.outerWidth.value=CONFIG.outerLine*ratio;postMaterial.uniforms.innerWidth.value=CONFIG.innerLine*ratio;
+ camera.aspect=width/height;camera.fov=mobile()?44:36;
+ camera.setViewOffset(width,height,cropX,0,cropWidth,cropHeight);camera.updateProjectionMatrix();
+ fx.resize(width,height,Math.min(devicePixelRatio||1,1.5));worldCleared=false;fpsMeter.reset();
+ if(state==='reveal'){const c=center();fx.orbit(c.x,c.y,mobile()?170:250,mobile()?182:212,!mobile())}
+ if(document.documentElement.dataset.ready==='true')drawFrame(performance.now());
+}
+const transparentVisibility=[];
+function render(force=false){
+ renderer.info.reset();
+ if(!model.chest.visible&&!model.hero.visible){
+  if(force||!worldCleared){renderer.setRenderTarget(null);renderer.clear();worldCleared=true;}
+  renderStats.calls=renderStats.triangles=0;return;
+ }
+ worldCleared=false;
  renderer.setRenderTarget(colorRT);renderer.clear();renderer.render(scene,camera);
- const visible=transparentMeshes.map(o=>o.visible);transparentMeshes.forEach(o=>o.visible=false);
- scene.overrideMaterial=normalMaterial;renderer.setRenderTarget(normalRT);renderer.clear();renderer.render(scene,camera);scene.overrideMaterial=null;transparentMeshes.forEach((o,i)=>o.visible=visible[i]);
+ for(let i=0;i<transparentMeshes.length;i++){transparentVisibility[i]=transparentMeshes[i].visible;transparentMeshes[i].visible=false;}
+ scene.overrideMaterial=normalMaterial;renderer.setRenderTarget(normalRT);renderer.clear();renderer.render(scene,camera);scene.overrideMaterial=null;
+ for(let i=0;i<transparentMeshes.length;i++)transparentMeshes[i].visible=transparentVisibility[i];
  renderer.setRenderTarget(null);renderer.clear();renderer.render(postScene,postCamera);
+ renderStats.calls=renderer.info.render.calls;renderStats.triangles=renderer.info.render.triangles;
 }
 function stopLoops(){for(const tw of loops)tw.kill();loops=[];pose.shakeX=pose.shakeY=pose.shakeZ=0;pose.rx=pose.rz=0;idleEnabled=false;}
 function startIdle(){stopLoops();idleEnabled=true;pose.sx=pose.sy=pose.sz=1;pose.y=0;pose.ry=-.42;
@@ -1036,25 +1341,26 @@ function claim(){if(busy||state!=='results')return;lock(true);audio.unlock();$('
 }
 function finishClaim(){setState('claimed');lock(false);$('#action-label').textContent='ANOTHER LITTLE WONDER';$('#tap-hint').textContent='REPLAY THE MOMENT';gsap.to('#claimed-note',{autoAlpha:1,duration:.35,ease:'power2.out'});audio.upgrade(2)}
 function reset(){if(master)master.kill();gsap.killTweensOf('*');stopLoops();fx.clear();Object.assign(pose,{y:0,ry:-.42,rx:0,rz:0,sx:1,sy:1,sz:1,charge:0,shakeX:0,shakeY:0,shakeZ:0,cameraPush:0,heroScale:0,heroY:0,heroRY:0});model.chest.visible=true;model.hero.visible=false;model.lid.rotation.x=0;model.setSeamGlow(0);gsap.set(['#rewards','#relic-info','#claimed-note'],{autoAlpha:0});gsap.set('.reward-card',{clearProps:'all'});gsap.set(['#reveal-backdrop','#pillar','#bloom'],{opacity:0});gsap.set(['#stage-heading','#backdrop','#rarity-rail','#vault-note','#tier-medallion','#floor-shadow','#phase-caption'],{opacity:1});gsap.set('#action-area',{autoAlpha:1,y:0});gsap.set(app,{x:0,y:0});$('#eyebrow').innerHTML='<span></span> THE WISHKEEPER’S VAULT <span></span>';$('#phase-caption').textContent='A little mystery. All yours.';setTier(0);setState('ready');$('#action-label').textContent=mode==='auto'?'OPEN THE VAULT':'UPGRADE THE VAULT';$('#tap-hint').innerHTML=mode==='auto'?'<span class="tap-dot"></span> ONE TAP. LET THE MAGIC HAPPEN.':'TAP TO REACH THE NEXT RARITY.';started=false;lock(false);startIdle();}
-function animate(now){requestAnimationFrame(animate);if(debugPaused)return;drawFrame(now)}
+function animate(now){requestAnimationFrame(animate);if(debugPaused||document.hidden)return;const begin=performance.now();drawFrame(now);fpsMeter.sample(now,{state,workMs:performance.now()-begin,drawCalls:renderStats.calls,triangles:renderStats.triangles,pixelRatio:renderer.getPixelRatio()});}
 function drawFrame(now){let dt=Math.min((now-lastTime)/1000,.05);lastTime=now;const time=now*.001;
- if(frameCount++%60===0)frameSamples.push(dt);if(frameSamples.length>20)frameSamples.shift();
+
  const scale=mobile()?Math.min(.92,width/510):.83;let idleY=idleEnabled?(reduced?0:Math.sin(time*1.45)*.09):0,idleRY=idleEnabled?(reduced?0:Math.sin(time*.6)*.13):0;
  if(state==='charge'){const p=pose.charge,a=reduced?.008:.015+p*p*.05;pose.shakeX=Math.sin(time*(44+p*60))*a;pose.shakeZ=Math.cos(time*(51+p*60))*a;model.setSeamGlow(p);const c=center();fx.charge(c.x,c.y,p,dt)}
  if(state==='charge'||state==='burst'){const c=center();fx.pillar(c.x,c.y,mobile()?180:260,mobile()?260:360,state==='charge'?pose.charge:1)}
  model.chest.position.set(pose.shakeX,pose.y+idleY+.20,0);model.chest.rotation.set(pose.rx,pose.ry+idleRY,pose.rz+pose.shakeZ);model.chest.scale.set(pose.sx*scale,pose.sy*scale,pose.sz*scale);
  model.hero.position.set(0,pose.heroY+(state==='reveal'&&!reduced?Math.sin(time*1.4)*.06:0),0);model.hero.rotation.set(0,pose.heroRY+(state==='reveal'&&!reduced?Math.sin(time*.8)*.065:0),0);model.hero.scale.setScalar(pose.heroScale*(mobile()?scale*.93:.85));
- model.update(time);camera.position.z=(mobile()?10.7:11.5)-pose.cameraPush;camera.position.y=mobile()?2.5:3;camera.lookAt(0,mobile()?-.06:0,0);camera.updateMatrixWorld();
- const shadow=$('#floor-shadow');shadow.style.transform=`scale(${1-Math.max(0,pose.y+idleY)*.13})`;shadow.style.opacity=model.chest.visible?String(.9-Math.max(0,pose.y+idleY)*.28):'0';
+ if(model.hero.visible)model.update(time);camera.position.z=(mobile()?10.7:11.5)-pose.cameraPush;camera.position.y=mobile()?2.5:3;camera.lookAt(0,mobile()?-.06:0,0);camera.updateMatrixWorld();
+ const shadow=floorShadow;shadow.style.transform=`scale(${1-Math.max(0,pose.y+idleY)*.13})`;shadow.style.opacity=model.chest.visible?String(.9-Math.max(0,pose.y+idleY)*.28):'0';
  fx.update(dt,time);render();
 }
 $('#action').addEventListener('click',begin);$('#world').style.pointerEvents='auto';$('#world').addEventListener('click',()=>{if(state==='ready'||state==='tierReady')begin()});
 $('#mute').addEventListener('click',()=>{muted=!muted;audio.setMuted(muted);$('#mute').classList.toggle('muted',muted);$('#mute').setAttribute('aria-label',muted?'Unmute sound':'Mute sound');$('#mute').title=muted?'Unmute sound':'Mute sound'});
 for(const [selector,m] of [['#auto-mode','auto'],['#manual-mode','manual']])$(selector).addEventListener('click',()=>{if(busy)return;mode=m;$('#auto-mode').classList.toggle('selected',m==='auto');$('#manual-mode').classList.toggle('selected',m==='manual');$('#auto-mode').setAttribute('aria-pressed',String(m==='auto'));$('#manual-mode').setAttribute('aria-pressed',String(m==='manual'));reset()});
 $('.brand').addEventListener('click',e=>{e.preventDefault();if(!busy)reset()});window.addEventListener('resize',resize);
+document.addEventListener('visibilitychange',()=>{lastTime=performance.now();if(document.hidden)fpsMeter.suspend();else if(!debugPaused)fpsMeter.resume();});
 // Deliberate testing hooks: no time travel or replacement artwork; capture the actual running stages.
-window.__vault={get state(){return state},get tier(){return tier},get busy(){return busy},get history(){return history},get config(){return CONFIG},get renderer(){return renderer},get model(){return model},get pose(){return Object.fromEntries(Object.entries(pose).filter(([k])=>k!=='_gsap'))},get fx(){return fx},get audio(){return audio},get motionReduced(){return reduced},get performance(){return{calls:renderer.info.render.calls,triangles:renderer.info.render.triangles,averageFrame:frameSamples.reduce((a,b)=>a+b,0)/Math.max(1,frameSamples.length)}},advance(seconds){debugPaused=true;gsap.ticker.sleep();const steps=Math.ceil(seconds*60);for(let i=0;i<steps;i++){gsap.globalTimeline.time(gsap.globalTimeline.time()+1/60,false);drawFrame(lastTime+1000/60)}},play:begin,claim,reset,setMuted(v){muted=v;audio.setMuted(v);$('#mute').classList.toggle('muted',v)},pause(){debugPaused=true;gsap.globalTimeline.pause();$$('.rays,.hero-aura').forEach(e=>e.style.animationPlayState='paused');render()},resume(){lastTime=performance.now();debugPaused=false;gsap.globalTimeline.resume();gsap.ticker.wake();$$('.rays,.hero-aura').forEach(e=>e.style.animationPlayState='running')},render};
-try{init3D();startIdle();render();requestAnimationFrame(animate);document.documentElement.dataset.ready='true'}catch(err){console.error(err);$('#fallback').hidden=false;$('#action').disabled=true;window.__vaultError=String(err)}
+window.__vault={get state(){return state},get tier(){return tier},get busy(){return busy},get history(){return history},get config(){return CONFIG},get renderer(){return renderer},get model(){return model},get pose(){return Object.fromEntries(Object.entries(pose).filter(([k])=>k!=='_gsap'))},get fx(){return fx},get audio(){return audio},get motionReduced(){return reduced},get performance(){return {...fpsMeter.snapshot(),calls:renderStats.calls,triangles:renderStats.triangles,renderPixels:renderer.domElement.width*renderer.domElement.height}},advance(seconds){debugPaused=true;fpsMeter.suspend();gsap.ticker.sleep();const steps=Math.ceil(seconds*60);for(let i=0;i<steps;i++){gsap.globalTimeline.time(gsap.globalTimeline.time()+1/60,false);drawFrame(lastTime+1000/60)}},play:begin,claim,reset,setMuted(v){muted=v;audio.setMuted(v);$('#mute').classList.toggle('muted',v)},pause(){debugPaused=true;fpsMeter.suspend();gsap.globalTimeline.pause();$$('.rays,.hero-aura').forEach(e=>e.style.animationPlayState='paused');render()},resume(){lastTime=performance.now();debugPaused=false;fpsMeter.resume();gsap.globalTimeline.resume();gsap.ticker.wake();$$('.rays,.hero-aura').forEach(e=>e.style.removeProperty('animation-play-state'))},render};
+try{init3D();startIdle();drawFrame(performance.now());requestAnimationFrame(animate);document.documentElement.dataset.ready='true'}catch(err){console.error(err);$('#fallback').hidden=false;$('#action').disabled=true;window.__vaultError=String(err)}
 })();
 </script>
 </body>
